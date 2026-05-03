@@ -1,0 +1,43 @@
+- generic [ref=e2]:
+  - complementary [ref=e3]:
+    - generic [ref=e4]:
+      - heading "Bio Deep Research" [level=1] [ref=e5]
+      - paragraph [ref=e6]: 围绕生物信息学问题自动完成澄清、规划、权威检索、证据整理与带引用结论生成。
+    - generic [ref=e7]:
+      - generic [ref=e8]:
+        - generic [ref=e9]: 运行状态
+        - generic [ref=e10]: 待机中
+      - paragraph [ref=e12]: 等待输入。
+      - generic [ref=e13]: 当前来源：-
+    - heading "研究日志" [level=2] [ref=e15]
+  - main [ref=e16]:
+    - generic [ref=e17]:
+      - generic [ref=e18]:
+        - generic [ref=e19] [cursor=pointer]: BRCA1 变异
+        - generic [ref=e20] [cursor=pointer]: TP53 肺癌
+        - generic [ref=e21] [cursor=pointer]: EGFR 耐药
+      - generic [ref=e22]:
+        - textbox "输入一个生物信息学问题，例如：BRCA1 c.185delAG 在乳腺癌中的临床意义是什么？" [ref=e23]
+        - button "开始研究" [ref=e24] [cursor=pointer]
+      - generic [ref=e25]:
+        - textbox "或者输入一个本地文件夹路径，例如：/tmp/bio_agent_demo_data" [ref=e26]
+        - button "探索文件夹" [ref=e27] [cursor=pointer]
+    - generic [ref=e28]:
+      - generic [ref=e29]:
+        - heading "研究 Brief" [level=2] [ref=e30]
+        - generic [ref=e31]: 研究开始后，这里会显示自动改写后的研究 brief。
+      - generic [ref=e32]:
+        - heading "待澄清项" [level=2] [ref=e33]
+        - generic [ref=e35]: 如果问题缺少物种、疾病或分析目标，这里会提示默认假设。
+    - generic [ref=e36]:
+      - generic [ref=e37]:
+        - heading "研究计划与证据" [level=2] [ref=e38]
+        - heading "研究问题" [level=3] [ref=e39]
+        - generic [ref=e41]: 研究开始后，这里会显示问题分解与来源优先级。
+        - heading "证据卡片" [level=3] [ref=e42]
+        - generic [ref=e44]: 联网检索得到的证据会实时出现在这里。
+      - generic [ref=e45]:
+        - heading "结论与引用" [level=2] [ref=e46]
+        - generic [ref=e47]: 最终回答会在这里显示。
+        - heading "引用列表" [level=3] [ref=e48]
+        - generic [ref=e50]: 完成后会显示可点击的引用条目。
