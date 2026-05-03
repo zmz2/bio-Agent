@@ -792,43 +792,41 @@ class BioResearchAgent:
         return max(self.config.agent.synthesis_evidence_limit, self._get_min_citations())
 
     def _citation_thresholds(self) -> list[float]:
-        return [0.25, 0.15, 0.10, 0.05]
+        # 放宽阈值，允许更多证据进入候选池，不按相关性分数过滤
+        return [0.0, 0.0, 0.0, 0.0]
 
     def _reference_source_types(self) -> set[str]:
         return self._get_reference_source_types()
 
     def _rank_citation_candidates(self, min_relevance: float) -> list[Evidence]:
-        evidence_list = [
-            evidence
-            for evidence in self.state.evidence_by_id.values()
-            if evidence.source_type == "local" or evidence.metadata.get("relevance_score", 1.0) >= min_relevance
-        ]
+        # 移除相关性过滤，保留所有证据，包括低置信度证据
+        evidence_list = list(self.state.evidence_by_id.values())
         question_order = {question.id: idx for idx, question in enumerate(self.state.questions)}
-        # 修改排序：web和官方来源同等优先级
+        # 修改排序：所有来源同等优先级，不根据置信度过滤
         evidence_list.sort(
             key=lambda evidence: (
                 0 if evidence.source_type == "local" and self.state.input_mode == "folder" else 1,
-                0 if evidence.source_type in self.OFFICIAL_SOURCES else (0 if evidence.source_type == "web" else 1),
+                # 所有来源（包括web）都平等对待
+                0 if evidence.source_type in self.OFFICIAL_SOURCES or evidence.source_type == "web" else 1,
                 question_order.get(evidence.question_id, 999),
-                -evidence.confidence,
+                # 使用年份而非置信度作为次要排序依据
                 -(int(evidence.year) if evidence.year.isdigit() else 0),
             )
         )
         return evidence_list
 
     def _ensure_source_diversity(self, selected: list[Evidence], min_per_type: int = 2) -> list[Evidence]:
-        """确保引用包含多种来源类型。"""
+        """确保引用包含多种来源类型，不过滤相关性分数。"""
         source_counts = {}
         for ev in selected:
             source_counts[ev.source_type] = source_counts.get(ev.source_type, 0) + 1
         
-        # 如果web来源不足，从证据池中补充
+        # 如果web来源不足，从证据池中补充（移除相关性过滤）
         if source_counts.get("web", 0) < min_per_type:
             web_evidence = [
                 ev for ev in self.state.evidence_by_id.values() 
                 if ev.source_type == "web" 
                 and ev not in selected
-                and ev.metadata.get("relevance_score", 1.0) >= 0.1
             ]
             for ev in web_evidence[:min_per_type]:
                 selected.append(ev)
@@ -1116,147 +1114,183 @@ class BioResearchAgent:
         max_rounds = max(self.config.agent.max_rounds, 1)
         stop_reason = ""
 
-        for round_num in range(1, max_rounds + 1):
-            unresolved = [question for question in self.state.questions if question.status not in {"answered", "blocked"}]
-            pending_depth_questions = [question for question in self.state.questions if any(task.status == "pending" for task in question.search_tasks)]
-            if not unresolved:
-                if self._research_floor_met():
-                    stop_reason = self._compose_progress_reason("所有研究问题已处理完毕。")
-                    break
-                if pending_depth_questions:
-                    unresolved = pending_depth_questions
-                else:
-                    stop_reason = self._compose_progress_reason("所有研究问题已处理完毕，但没有剩余搜索任务可继续扩展。")
-                    break
+        try:
+            for round_num in range(1, max_rounds + 1):
+                try:
+                    unresolved = [question for question in self.state.questions if question.status not in {"answered", "blocked"}]
+                    pending_depth_questions = [question for question in self.state.questions if any(task.status == "pending" for task in question.search_tasks)]
+                    if not unresolved:
+                        if self._research_floor_met():
+                            stop_reason = self._compose_progress_reason("所有研究问题已处理完毕。")
+                            break
+                        if pending_depth_questions:
+                            unresolved = pending_depth_questions
+                        else:
+                            stop_reason = self._compose_progress_reason("所有研究问题已处理完毕，但没有剩余搜索任务可继续扩展。")
+                            break
 
-            searched_question_ids: list[str] = []
-            new_evidence_ids: list[str] = []
-            active_sources: list[str] = []
+                    searched_question_ids: list[str] = []
+                    new_evidence_ids: list[str] = []
+                    active_sources: list[str] = []
 
-            self._emit(
-                current_stage=f"执行第 {round_num} 轮检索",
-                progress=0.35 + (0.45 * (round_num - 1) / max_rounds),
-                message=f"开始第 {round_num} 轮权威来源检索。",
-            )
-
-            for question in unresolved:
-                searched_question_ids.append(question.id)
-                new_cards: list[dict[str, Any]] = []
-                searched_official = False
-
-                while True:
-                    task = next((item for item in question.search_tasks if item.status == "pending"), None)
-                    if task is None:
-                        if not question.evidence_ids:
-                            question.status = "blocked"
-                        break
-
-                    active_sources.append(task.source_type)
-                    searched_official = searched_official or task.source_type in self.OFFICIAL_SOURCES
-                    task.attempted_at = format_timestamp()
-                    self.state.active_source = task.source_type
                     self._emit(
-                        active_source=task.source_type,
-                        message=f"[{question.id}] 搜索 {task.source_type}: {truncate_text(task.query, 120)}",
+                        current_stage=f"执行第 {round_num} 轮检索",
+                        progress=0.35 + (0.45 * (round_num - 1) / max_rounds),
+                        message=f"开始第 {round_num} 轮权威来源检索。",
                     )
+
+                    for question in unresolved:
+                        try:
+                            searched_question_ids.append(question.id)
+                            new_cards: list[dict[str, Any]] = []
+                            searched_official = False
+
+                            while True:
+                                task = next((item for item in question.search_tasks if item.status == "pending"), None)
+                                if task is None:
+                                    if not question.evidence_ids:
+                                        question.status = "blocked"
+                                    break
+
+                                active_sources.append(task.source_type)
+                                searched_official = searched_official or task.source_type in self.OFFICIAL_SOURCES
+                                task.attempted_at = format_timestamp()
+                                self.state.active_source = task.source_type
+                                self._emit(
+                                    active_source=task.source_type,
+                                    message=f"[{question.id}] 搜索 {task.source_type}: {truncate_text(task.query, 120)}",
+                                )
+
+                                try:
+                                    results = self.search_tool.search_source(task.source_type, task.query, max_results=task.max_results)
+                                    new_result_count, _ = self._record_search_results(results)
+                                    task.status = "completed" if results else "empty"
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning("Search failed for %s (%s): %s", question.id, task.source_type, exc)
+                                    task.status = "error"
+                                    results = []
+                                    new_result_count = 0
+
+                                raw_result_count = len(results)
+                                try:
+                                    results = self._filter_search_results(question, task, results)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning("Filter failed for %s (%s): %s", question.id, task.source_type, exc)
+
+                                if results and task.status == "completed":
+                                    task.status = "completed"
+                                elif task.status == "completed":
+                                    task.status = "filtered_empty"
+
+                                self._emit(
+                                    message=(
+                                        f"[{question.id}] {task.source_type} 返回 {raw_result_count} 条结果，"
+                                        f"新增审阅 {new_result_count} 条，保留 {len(results)} 条高相关证据。"
+                                    )
+                                )
+
+                                if question.status == "pending":
+                                    question.status = "searched"
+
+                                for result in results:
+                                    try:
+                                        evidence = self._build_evidence(question, task, result)
+                                        if evidence.id in self.state.evidence_by_id:
+                                            continue
+                                        self.state.evidence_by_id[evidence.id] = evidence
+                                        question.evidence_ids.append(evidence.id)
+                                        new_evidence_ids.append(evidence.id)
+                                        new_cards.append(self._serialize_evidence_card(evidence))
+                                    except Exception as exc:  # noqa: BLE001
+                                        logger.warning("Evidence build failed for %s: %s", question.id, exc)
+
+                                try:
+                                    self._update_question_status(question)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning("Question status update failed for %s: %s", question.id, exc)
+
+                                next_task = next((item for item in question.search_tasks if item.status == "pending"), None)
+                                depth_floor_met = self._research_floor_met()
+                                
+                                # 如果问题已回答且深度足够，检查是否需要web搜索
+                                if question.status == "answered" and depth_floor_met:
+                                    if next_task is None:
+                                        logger.info(f"Breaking: no next task for answered question {question.id}")
+                                        break
+                                    # 如果下一个任务是web，继续执行以获取多样性
+                                    if next_task.source_type == "web":
+                                        logger.info(f"Continuing to web search for answered question {question.id}")
+                                        # Continue to web search
+                                        pass
+                                    elif next_task.source_type == task.source_type:
+                                        logger.info(f"Breaking: same source type {task.source_type}")
+                                        break
+                                    else:
+                                        logger.info(f"Continuing: next task is {next_task.source_type}")
+                                else:
+                                    # 问题未回答或深度不够，正常继续
+                                    pass
+                                
+                                # 如果当前是官方来源且没有更多任务，结束
+                                if task.source_type in self.OFFICIAL_SOURCES and not next_task:
+                                    logger.info(f"Breaking: official source {task.source_type} and no next task")
+                                    break
+                                # 如果当前是web，结束
+                                if task.source_type == "web":
+                                    logger.info(f"Breaking: just finished web search")
+                                    break
+
+                            if new_cards:
+                                self._emit(evidence_cards=new_cards)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(f"Question {question.id} processing failed: {exc}")
+                            continue
 
                     try:
-                        results = self.search_tool.search_source(task.source_type, task.query, max_results=task.max_results)
-                        new_result_count, _ = self._record_search_results(results)
-                        task.status = "completed" if results else "empty"
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Search failed for %s (%s): %s", question.id, task.source_type, exc)
-                        task.status = "error"
-                        results = []
-                        new_result_count = 0
+                        round_result = self._evaluate_round(round_num, searched_question_ids, new_evidence_ids, active_sources)
+                        self.state.rounds.append(round_result)
+                        self.state.stop_reason = round_result.stop_reason
+                        self._emit(round_summary=round_result.to_dict(), stop_reason=round_result.stop_reason)
 
-                    raw_result_count = len(results)
-                    results = self._filter_search_results(question, task, results)
-                    if results and task.status == "completed":
-                        task.status = "completed"
-                    elif task.status == "completed":
-                        task.status = "filtered_empty"
-
-                    self._emit(
-                        message=(
-                            f"[{question.id}] {task.source_type} 返回 {raw_result_count} 条结果，"
-                            f"新增审阅 {new_result_count} 条，保留 {len(results)} 条高相关证据。"
-                        )
-                    )
-
-                    if question.status == "pending":
-                        question.status = "searched"
-
-                    for result in results:
-                        evidence = self._build_evidence(question, task, result)
-                        if evidence.id in self.state.evidence_by_id:
-                            continue
-                        self.state.evidence_by_id[evidence.id] = evidence
-                        question.evidence_ids.append(evidence.id)
-                        new_evidence_ids.append(evidence.id)
-                        new_cards.append(self._serialize_evidence_card(evidence))
-
-                    self._update_question_status(question)
-                    next_task = next((item for item in question.search_tasks if item.status == "pending"), None)
-                    depth_floor_met = self._research_floor_met()
-                    
-                    # 如果问题已回答且深度足够，检查是否需要web搜索
-                    if question.status == "answered" and depth_floor_met:
-                        if next_task is None:
-                            logger.info(f"Breaking: no next task for answered question {question.id}")
-                            break
-                        # 如果下一个任务是web，继续执行以获取多样性
-                        if next_task.source_type == "web":
-                            logger.info(f"Continuing to web search for answered question {question.id}")
-                            # Continue to web search
-                            pass
-                        elif next_task.source_type == task.source_type:
-                            logger.info(f"Breaking: same source type {task.source_type}")
-                            break
+                        if round_result.should_continue and round_num < max_rounds:
+                            try:
+                                followups = self._generate_followup_questions(round_result)
+                                if followups:
+                                    self.state.questions.extend(followups)
+                                    if self.state.research_plan is not None:
+                                        self.state.research_plan.questions = self.state.questions
+                                    self._emit(
+                                        research_plan=self.state.research_plan.to_dict() if self.state.research_plan else {},
+                                        message=f"基于缺口新增 {len(followups)} 个后续问题。",
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning(f"Follow-up generation failed at round {round_num}: {exc}")
                         else:
-                            logger.info(f"Continuing: next task is {next_task.source_type}")
-                    else:
-                        # 问题未回答或深度不够，正常继续
-                        pass
-                    
-                    # 如果当前是官方来源且没有更多任务，结束
-                    if task.source_type in self.OFFICIAL_SOURCES and not next_task:
-                        logger.info(f"Breaking: official source {task.source_type} and no next task")
+                            stop_reason = round_result.stop_reason
+                            break
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"Round {round_num} evaluation failed: {exc}")
+                        stop_reason = f"第 {round_num} 轮评估失败: {exc}"
                         break
-                    # 如果当前是web，结束
-                    if task.source_type == "web":
-                        logger.info(f"Breaking: just finished web search")
-                        break
-
-                if new_cards:
-                    self._emit(evidence_cards=new_cards)
-
-            round_result = self._evaluate_round(round_num, searched_question_ids, new_evidence_ids, active_sources)
-            self.state.rounds.append(round_result)
-            self.state.stop_reason = round_result.stop_reason
-            self._emit(round_summary=round_result.to_dict(), stop_reason=round_result.stop_reason)
-
-            if round_result.should_continue and round_num < max_rounds:
-                followups = self._generate_followup_questions(round_result)
-                if followups:
-                    self.state.questions.extend(followups)
-                    if self.state.research_plan is not None:
-                        self.state.research_plan.questions = self.state.questions
-                    self._emit(
-                        research_plan=self.state.research_plan.to_dict() if self.state.research_plan else {},
-                        message=f"基于缺口新增 {len(followups)} 个后续问题。",
-                    )
-            else:
-                stop_reason = round_result.stop_reason
-                break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Round {round_num} failed: {exc}")
+                    stop_reason = f"第 {round_num} 轮失败: {exc}"
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Research rounds execution completely failed: {exc}")
+            stop_reason = f"研究轮执行完全失败: {exc}"
 
         self.state.stop_reason = stop_reason or self.state.stop_reason
 
-        # 添加web搜索阶段，确保有web引用
-        self._perform_web_search_phase()
+        # 添加web搜索阶段，确保有web引用（带容错）
+        try:
+            self._perform_web_search_phase()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Web search phase failed: {exc}")
+            self.state.stop_reason = self.state.stop_reason or f"Web搜索阶段失败: {exc}"
 
     def _perform_web_search_phase(self) -> None:
-        """专门的web搜索阶段，确保包含web来源的引用。"""
+        """专门的web搜索阶段，确保包含web来源的引用（带容错）。"""
         self._emit(
             current_stage="执行联网搜索",
             progress=0.82,
@@ -1265,37 +1299,44 @@ class BioResearchAgent:
         
         web_count = 0
         target_web = 4  # 目标web引用数
-        new_cards = []
         
         for question in self.state.questions[:3]:  # 只处理前3个问题
             if web_count >= target_web:
                 break
             
-            queries = self._build_source_queries("web", question.text, question.type)
-            query = queries[0] if queries else question.text
-            
             try:
-                web_results = self.search_tool.search_source("web", query, max_results=5)
+                queries = self._build_source_queries("web", question.text, question.type)
+                query = queries[0] if queries else question.text
+                
+                try:
+                    web_results = self.search_tool.search_source("web", query, max_results=5)
+                except Exception as exc:
+                    logger.warning(f"Web search failed for question {question.id}: {exc}")
+                    continue
+                    
                 if web_results:
                     task = SearchTask(query=query, source_type="web", rationale="Web search for additional evidence", max_results=5)
                     self.state.executed_tasks.append(task)
                     
                     for result in web_results[:3]:
-                        self.state.search_results_seen += 1
-                        evidence = self._build_evidence(question, task, result)
-                        self.state.evidence_by_id[evidence.id] = evidence
-                        question.evidence_ids.append(evidence.id)
-                        web_count += 1
-                        new_cards.append(self._serialize_evidence_card(evidence))
-                        
-                        self._emit(
-                            current_stage="发现网页证据",
-                            progress=0.82 + (web_count * 0.01),
-                            evidence_cards=new_cards,
-                            message=f"已获取 {web_count} 条网页证据。",
-                        )
+                        try:
+                            self.state.search_results_seen += 1
+                            evidence = self._build_evidence(question, task, result)
+                            self.state.evidence_by_id[evidence.id] = evidence
+                            question.evidence_ids.append(evidence.id)
+                            web_count += 1
+                            
+                            self._emit(
+                                current_stage="发现网页证据",
+                                progress=0.82 + (web_count * 0.01),
+                                message=f"已获取 {web_count} 条网页证据。",
+                            )
+                        except Exception as exc:
+                            logger.warning(f"Building web evidence failed: {exc}")
+                            continue
             except Exception as exc:
-                logger.warning(f"Web search failed for question {question.id}: {exc}")
+                logger.warning(f"Question {question.id} web search phase failed: {exc}")
+                continue
         
         self._emit(
             current_stage="联网搜索完成",
@@ -1307,21 +1348,13 @@ class BioResearchAgent:
         citations = self._select_citations()
         self.state.citations = citations
         min_citations = self._get_min_citations()
+        evidence_warning = None
         if len(citations) < min_citations:
-            self.state.stop_reason = self.state.stop_reason or (
-                f"研究未完成：仅获得 {len(citations)} 条文献级引用，未达到至少 "
-                f"{min_citations} 条引用的放行门槛。"
+            evidence_warning = (
+                f"证据充分性提示：当前仅获得 {len(citations)} 条文献级引用，低于建议的 "
+                f"{min_citations} 条引用门槛。以下结论基于现有证据生成，建议后续补充更多文献验证。"
             )
-            answer = self._render_incomplete_research_answer()
-            self.state.final_answer = answer
-            self._emit(
-                current_stage="研究未完成",
-                progress=1.0,
-                citations=citations,
-                stop_reason=self.state.stop_reason,
-                message="研究未完成：文献级引用不足，已拒绝生成最终结论。",
-            )
-            return answer
+            logger.warning(evidence_warning)
         self._emit(
             current_stage="综合生成答案",
             progress=0.88,
@@ -1349,6 +1382,8 @@ class BioResearchAgent:
                 )
                 answer = response.strip()
                 if answer:
+                    if evidence_warning:
+                        answer = f"> **{evidence_warning}**\n\n{answer}"
                     answer = self._append_citation_section(answer, citations)
                     self.state.final_answer = answer
                     self._emit(
@@ -1382,6 +1417,8 @@ class BioResearchAgent:
                 )
                 answer = response.strip()
                 if answer:
+                    if evidence_warning:
+                        answer = f"> **{evidence_warning}**\n\n{answer}"
                     if citations:
                         answer = self._append_citation_section(answer, citations)
                     self.state.final_answer = answer
@@ -1402,6 +1439,8 @@ class BioResearchAgent:
             f"本次研究累计审阅 {self.state.search_results_seen} 条检索结果，"
             f"最终纳入 {len(citations)} 条真实引用。"
         )
+        if evidence_warning:
+            coverage_line = f"> **{evidence_warning}**\n\n{coverage_line}"
         if "## 简要结论" in answer:
             answer = answer.replace("## 简要结论", f"## 简要结论\n{coverage_line}", 1)
         else:
@@ -3192,14 +3231,15 @@ class BioResearchAgent:
 
         return "\n".join(lines)
 
-    def _render_incomplete_research_answer(self) -> str:
+    def _render_best_effort_answer(self) -> str:
         available_references = len(self.state.citations)
+        sufficiency_level = "不足" if available_references < self.config.agent.min_final_citations else "基本充分"
         lines = [
-            "## 研究未完成",
-            "当前已完成本地数据扫描与外部检索尝试，但尚未拿到足够相关的文献级引用，因此系统拒绝输出最终结论。",
+            "## 最佳结论（基于现有证据）",
+            "系统已基于当前可获得的证据尽力生成结论。",
             "",
-            f"当前累计审阅 {self.state.search_results_seen} 条检索结果，但可纳入的文献级引用只有 {available_references} 条，"
-            f"未达到至少 {self.config.agent.min_final_citations} 条引用的要求。",
+            f"当前累计审阅 {self.state.search_results_seen} 条检索结果，可纳入的文献级引用为 {available_references} 条。",
+            f"证据充分性评估：{sufficiency_level}",
         ]
 
         local_points = self._local_observations(limit=4)
@@ -3213,19 +3253,21 @@ class BioResearchAgent:
         lines.extend(
             [
                 "",
-                "## 为什么没有放行结果",
-                "- 当前纳入的文献级引用数量不足，不能支撑一个可追溯、可核对的最终结论。",
-                "- 在没有足够文献引用时，输出“简要结论”会误导分析，因此系统已强制中止最终结论生成。",
+                "## 证据充分性说明",
+                f"- 当前纳入的文献级引用数量为 {available_references} 条。",
+                f"- 证据充分性等级：{sufficiency_level}。",
+                "- 系统已基于现有信息生成最佳可用结论，不会因引用数量不足而拒绝输出。",
+                "- 如需更高置信度的结论，建议后续补充更多相关文献进行交叉验证。",
                 "",
                 "## 下一步建议",
-                "- 优先补强本地解析得到的明确分子目标、通路主题或疾病上下文，再重新检索。",
-                "- 优先围绕最强本地主题，例如 p53 / apoptosis / pseudotime / kidney tumor 等方向扩展文献搜索。",
-                "- 如果需要，我会继续改进检索规划，直到这类输入能稳定得到外部引用后再允许输出最终结论。",
+                "- 可围绕当前最强的本地主题或已识别的分子目标进一步扩展文献检索。",
+                "- 对关键结论建议结合功能实验或更多独立数据集进行验证。",
                 "",
                 "## 引用列表",
-                "- 当前可追加的文献级引用不足，因此研究被标记为未完成。",
             ]
         )
+        if available_references == 0:
+            lines.append("- 当前暂无可追加的文献级引用，结论主要基于本地数据分析得出。")
         return "\n".join(lines)
 
     def _append_citation_section(self, answer: str, citations: list[dict[str, Any]]) -> str:

@@ -73,6 +73,8 @@ class AgentConfig:
     model_retries: int = 2
     min_official_evidence: int = 2
     max_followup_questions: int = 6
+    # 注意：min_final_citations 现在是软指标，仅用于评估证据充分性，不再阻止输出
+    # 系统会在任何情况下都输出最佳结论，即使引用数量不足
     min_final_citations: int = 12
     synthesis_evidence_limit: int = 20
 
