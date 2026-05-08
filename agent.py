@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import threading
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from prompts import (
     SYSTEM_PROMPT,
 )
 from search_tool import SearchResult, SearchTool, WebContentFetcher
+from full_text_fetcher import FullTextFetcher
 from utils import EntityParser, dedupe_preserve_order, format_timestamp, safe_json_parse, truncate_text
 from agent_improvements import QueryExpander, EvidenceScorer, ConflictDetector, MemoryManager, Conflict, MemoryItem
 
@@ -619,6 +621,7 @@ class Evidence:
     confidence: float
     retrieved_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    full_content: str = ""  # 完整的原文内容
 
 
 @dataclass
@@ -718,7 +721,8 @@ class BioResearchAgent:
         self.conflict_detector = ConflictDetector()
         self.memory_manager = MemoryManager()
         
-        # 初始化网页全文抓取工具
+        # 初始化全文内容抓取工具
+        self.full_text_fetcher = FullTextFetcher()
         self.content_fetcher = WebContentFetcher()
 
     def _is_bio_topic(self) -> bool:
@@ -740,15 +744,9 @@ class BioResearchAgent:
         logger.info(f"Topic detection - input_mode: {self.state.input_mode}, has_bio_content: {has_bio_content}, has_bio_keyword: {has_bio_keyword}, is_bio_topic: {is_bio}")
         return is_bio
 
-    def _get_min_citations(self) -> int:
-        """根据主题类型返回最低引用要求。"""
-        return max(3, min(self.config.agent.min_final_citations, 10))
-
     def _get_reference_source_types(self) -> set[str]:
-        """根据主题类型返回允许的引用来源 - 始终包含web。"""
-        if self._is_bio_topic():
-            return {"pubmed", "web"}
-        return {"pubmed", "web"}
+        """根据主题类型返回允许的引用来源 - 所有来源平等对待。"""
+        return {"pubmed", "web", "clinvar", "uniprot"}
 
     def _emit(self, *, current_stage: Optional[str] = None, progress: Optional[float] = None, message: Optional[str] = None, **extra: Any) -> None:
         payload: dict[str, Any] = {}
@@ -772,7 +770,6 @@ class BioResearchAgent:
 
     def _record_search_results(self, results: list[SearchResult]) -> tuple[int, int]:
         new_total = 0
-        new_official = 0
         for result in results:
             signature = self._raw_result_signature(result)
             if not signature or signature in self.state.search_result_signatures:
@@ -780,16 +777,10 @@ class BioResearchAgent:
             self.state.search_result_signatures.add(signature)
             self.state.search_results_seen += 1
             new_total += 1
-            if result.source_type in self.OFFICIAL_SOURCES:
-                self.state.official_search_results_seen += 1
-                new_official += 1
-        return new_total, new_official
-
-    def _search_floor_met(self) -> bool:
-        return self.state.search_results_seen >= self.config.search.min_results_to_review
+        return new_total, 0
 
     def _citation_selection_limit(self) -> int:
-        return max(self.config.agent.synthesis_evidence_limit, self._get_min_citations())
+        return self.config.agent.synthesis_evidence_limit
 
     def _citation_thresholds(self) -> list[float]:
         # 放宽阈值，允许更多证据进入候选池，不按相关性分数过滤
@@ -802,36 +793,18 @@ class BioResearchAgent:
         # 移除相关性过滤，保留所有证据，包括低置信度证据
         evidence_list = list(self.state.evidence_by_id.values())
         question_order = {question.id: idx for idx, question in enumerate(self.state.questions)}
-        # 修改排序：所有来源同等优先级，不根据置信度过滤
+        # 修改排序：所有来源完全同等优先级，只根据问题和年份排序
         evidence_list.sort(
             key=lambda evidence: (
                 0 if evidence.source_type == "local" and self.state.input_mode == "folder" else 1,
-                # 所有来源（包括web）都平等对待
-                0 if evidence.source_type in self.OFFICIAL_SOURCES or evidence.source_type == "web" else 1,
+                # 所有来源完全平等：pubmed、web、clinvar、uniprot 不分优先级
+                0,
                 question_order.get(evidence.question_id, 999),
-                # 使用年份而非置信度作为次要排序依据
+                # 使用年份作为次要排序依据
                 -(int(evidence.year) if evidence.year.isdigit() else 0),
             )
         )
         return evidence_list
-
-    def _ensure_source_diversity(self, selected: list[Evidence], min_per_type: int = 2) -> list[Evidence]:
-        """确保引用包含多种来源类型，不过滤相关性分数。"""
-        source_counts = {}
-        for ev in selected:
-            source_counts[ev.source_type] = source_counts.get(ev.source_type, 0) + 1
-        
-        # 如果web来源不足，从证据池中补充（移除相关性过滤）
-        if source_counts.get("web", 0) < min_per_type:
-            web_evidence = [
-                ev for ev in self.state.evidence_by_id.values() 
-                if ev.source_type == "web" 
-                and ev not in selected
-            ]
-            for ev in web_evidence[:min_per_type]:
-                selected.append(ev)
-        
-        return selected
 
     def _local_observations(self, limit: int = 4) -> list[dict[str, Any]]:
         findings = list((self.state.local_context or {}).get("findings", []))
@@ -857,6 +830,9 @@ class BioResearchAgent:
             for evidence in self._rank_citation_candidates(threshold):
                 if evidence.source_type not in allowed_sources:
                     continue
+                # 强制要求必须有全文内容
+                if not evidence.full_content or len(evidence.full_content) < 500:
+                    continue
                 signature = (evidence.source_type, evidence.source_id or evidence.url)
                 if signature in seen_sources:
                     continue
@@ -864,12 +840,6 @@ class BioResearchAgent:
                 selected.append(evidence)
         self.state.citation_candidates_seen = len(selected)
         return selected
-
-    def _citation_floor_met(self) -> bool:
-        return len(self._candidate_citation_pool()) >= self._get_min_citations()
-
-    def _research_floor_met(self) -> bool:
-        return self._search_floor_met() and self._citation_floor_met()
 
     def _compose_progress_reason(self, base_reason: str) -> str:
         return (
@@ -976,7 +946,7 @@ class BioResearchAgent:
             "diseases": dedupe_preserve_order(local.get("diseases", [])),
             "species": dedupe_preserve_order(local.get("species", [])),
             "sample_type": local.get("sample_type"),
-            "research_focus": self._infer_focus(user_input),
+            "research_focus": [],
             "keywords": [],
             "other_entities": dedupe_preserve_order(local.get("other_entities", [])),
         }
@@ -1059,7 +1029,7 @@ class BioResearchAgent:
                         parsed_specs.append(
                             {
                                 "text": text,
-                                "type": self._normalize_question_type(item.get("type") or self._classify_question(text)),
+                                "type": (item.get("type") or "general").strip().lower(),
                                 "priority": int(item.get("priority") or 1),
                                 "why": item.get("why") or "模型建议补充该研究维度。",
                             }
@@ -1077,9 +1047,8 @@ class BioResearchAgent:
             if key in seen_questions:
                 continue
             seen_questions.add(key)
-            question_type = self._normalize_question_type(spec.get("type") or self._classify_question(text))
-            source_priority = self._source_priority_for_question(question_type)
-            search_tasks = self._build_search_tasks(text, question_type, source_priority)
+            question_type = (spec.get("type") or "general").strip().lower()
+            search_tasks = self._build_search_tasks(text, question_type)
             questions.append(
                 Question(
                     id=self._next_question_id("Q", existing=questions),
@@ -1087,9 +1056,9 @@ class BioResearchAgent:
                     type=question_type,
                     priority=int(spec.get("priority") or 1),
                     why=spec.get("why") or "补齐研究证据链。",
-                    source_priority=source_priority,
+                    source_priority=["pubmed", "web", "uniprot", "clinvar"],
                     search_tasks=search_tasks,
-                    min_evidence=self._min_evidence_for_question(question_type),
+                    min_evidence=2,
                 )
             )
         questions.sort(key=lambda item: (item.priority, item.id))
@@ -1119,10 +1088,8 @@ class BioResearchAgent:
                 try:
                     unresolved = [question for question in self.state.questions if question.status not in {"answered", "blocked"}]
                     pending_depth_questions = [question for question in self.state.questions if any(task.status == "pending" for task in question.search_tasks)]
+                    
                     if not unresolved:
-                        if self._research_floor_met():
-                            stop_reason = self._compose_progress_reason("所有研究问题已处理完毕。")
-                            break
                         if pending_depth_questions:
                             unresolved = pending_depth_questions
                         else:
@@ -1209,35 +1176,14 @@ class BioResearchAgent:
                                 except Exception as exc:  # noqa: BLE001
                                     logger.warning("Question status update failed for %s: %s", question.id, exc)
 
+                                try:
+                                    self._adapt_search_strategy_dynamically(question, task, results)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.warning("Dynamic strategy adaptation failed for %s: %s", question.id, exc)
+
+                                # 检查是否还有下一个待执行的任务
                                 next_task = next((item for item in question.search_tasks if item.status == "pending"), None)
-                                depth_floor_met = self._research_floor_met()
-                                
-                                # 如果问题已回答且深度足够，检查是否需要web搜索
-                                if question.status == "answered" and depth_floor_met:
-                                    if next_task is None:
-                                        logger.info(f"Breaking: no next task for answered question {question.id}")
-                                        break
-                                    # 如果下一个任务是web，继续执行以获取多样性
-                                    if next_task.source_type == "web":
-                                        logger.info(f"Continuing to web search for answered question {question.id}")
-                                        # Continue to web search
-                                        pass
-                                    elif next_task.source_type == task.source_type:
-                                        logger.info(f"Breaking: same source type {task.source_type}")
-                                        break
-                                    else:
-                                        logger.info(f"Continuing: next task is {next_task.source_type}")
-                                else:
-                                    # 问题未回答或深度不够，正常继续
-                                    pass
-                                
-                                # 如果当前是官方来源且没有更多任务，结束
-                                if task.source_type in self.OFFICIAL_SOURCES and not next_task:
-                                    logger.info(f"Breaking: official source {task.source_type} and no next task")
-                                    break
-                                # 如果当前是web，结束
-                                if task.source_type == "web":
-                                    logger.info(f"Breaking: just finished web search")
+                                if next_task is None:
                                     break
 
                             if new_cards:
@@ -1282,79 +1228,9 @@ class BioResearchAgent:
 
         self.state.stop_reason = stop_reason or self.state.stop_reason
 
-        # 添加web搜索阶段，确保有web引用（带容错）
-        try:
-            self._perform_web_search_phase()
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Web search phase failed: {exc}")
-            self.state.stop_reason = self.state.stop_reason or f"Web搜索阶段失败: {exc}"
-
-    def _perform_web_search_phase(self) -> None:
-        """专门的web搜索阶段，确保包含web来源的引用（带容错）。"""
-        self._emit(
-            current_stage="执行联网搜索",
-            progress=0.82,
-            message="正在执行联网搜索以获取更多样化的证据。",
-        )
-        
-        web_count = 0
-        target_web = 4  # 目标web引用数
-        
-        for question in self.state.questions[:3]:  # 只处理前3个问题
-            if web_count >= target_web:
-                break
-            
-            try:
-                queries = self._build_source_queries("web", question.text, question.type)
-                query = queries[0] if queries else question.text
-                
-                try:
-                    web_results = self.search_tool.search_source("web", query, max_results=5)
-                except Exception as exc:
-                    logger.warning(f"Web search failed for question {question.id}: {exc}")
-                    continue
-                    
-                if web_results:
-                    task = SearchTask(query=query, source_type="web", rationale="Web search for additional evidence", max_results=5)
-                    self.state.executed_tasks.append(task)
-                    
-                    for result in web_results[:3]:
-                        try:
-                            self.state.search_results_seen += 1
-                            evidence = self._build_evidence(question, task, result)
-                            self.state.evidence_by_id[evidence.id] = evidence
-                            question.evidence_ids.append(evidence.id)
-                            web_count += 1
-                            
-                            self._emit(
-                                current_stage="发现网页证据",
-                                progress=0.82 + (web_count * 0.01),
-                                message=f"已获取 {web_count} 条网页证据。",
-                            )
-                        except Exception as exc:
-                            logger.warning(f"Building web evidence failed: {exc}")
-                            continue
-            except Exception as exc:
-                logger.warning(f"Question {question.id} web search phase failed: {exc}")
-                continue
-        
-        self._emit(
-            current_stage="联网搜索完成",
-            progress=0.85,
-            message=f"联网搜索完成，新增 {web_count} 条网页证据。",
-        )
-
     def synthesize_answer(self) -> str:
         citations = self._select_citations()
         self.state.citations = citations
-        min_citations = self._get_min_citations()
-        evidence_warning = None
-        if len(citations) < min_citations:
-            evidence_warning = (
-                f"证据充分性提示：当前仅获得 {len(citations)} 条文献级引用，低于建议的 "
-                f"{min_citations} 条引用门槛。以下结论基于现有证据生成，建议后续补充更多文献验证。"
-            )
-            logger.warning(evidence_warning)
         self._emit(
             current_stage="综合生成答案",
             progress=0.88,
@@ -1382,8 +1258,6 @@ class BioResearchAgent:
                 )
                 answer = response.strip()
                 if answer:
-                    if evidence_warning:
-                        answer = f"> **{evidence_warning}**\n\n{answer}"
                     answer = self._append_citation_section(answer, citations)
                     self.state.final_answer = answer
                     self._emit(
@@ -1417,8 +1291,6 @@ class BioResearchAgent:
                 )
                 answer = response.strip()
                 if answer:
-                    if evidence_warning:
-                        answer = f"> **{evidence_warning}**\n\n{answer}"
                     if citations:
                         answer = self._append_citation_section(answer, citations)
                     self.state.final_answer = answer
@@ -1439,8 +1311,6 @@ class BioResearchAgent:
             f"本次研究累计审阅 {self.state.search_results_seen} 条检索结果，"
             f"最终纳入 {len(citations)} 条真实引用。"
         )
-        if evidence_warning:
-            coverage_line = f"> **{evidence_warning}**\n\n{coverage_line}"
         if "## 简要结论" in answer:
             answer = answer.replace("## 简要结论", f"## 简要结论\n{coverage_line}", 1)
         else:
@@ -1597,11 +1467,6 @@ class BioResearchAgent:
             clarifications.append("未明确疾病或表型，当前优先回答通用功能与临床意义。")
             assumptions.append("若未指定疾病，优先从基因/变异的通用功能和已知临床意义回答。")
 
-        focus = self._infer_focus(user_input)
-        if not focus:
-            clarifications.append("未指定分析目标，当前默认覆盖功能机制、疾病关联和证据局限。")
-            assumptions.append("若未指定分析目标，默认输出功能机制、疾病关联、局限性和下一步建议。")
-
         if not entities.get("genes") and not entities.get("variants"):
             clarifications.append("问题较泛，若能补充基因、变异或通路，将得到更聚焦的结论。")
             assumptions.append("当前问题缺少明确分子目标，先按主题综述式 Deep Research 回答。")
@@ -1620,14 +1485,12 @@ class BioResearchAgent:
             genes = ", ".join(entities.get("genes", [])[:2]) or "未指定基因"
             variants = ", ".join(entities.get("variants", [])[:2]) or "未指定变异"
             diseases = ", ".join(entities.get("diseases", [])[:2]) or "未指定疾病"
-            focus = ", ".join(self._infer_focus(user_input) or ["mechanism", "disease relevance", "evidence limits"])
+            focus = "功能机制、疾病关联、证据局限"
             assumption_text = "；".join(assumptions) if assumptions else "无需额外假设。"
             return (
                 f"围绕输入问题'{user_input}'进行生物信息学 Deep Research。"
                 f"优先研究对象包括基因 {genes}、变异 {variants}、疾病/表型 {diseases}。"
                 f"研究重点为 {focus}。优先使用 PubMed/NCBI、ClinVar、UniProt 等权威来源，必要时再补充网页检索。"
-                f"默认至少审阅 {self.config.search.min_results_to_review} 条检索结果，"
-                f"并尽量提供不少于 {self.config.agent.min_final_citations} 条真实引用。"
                 f"输出中文研究型回答，包含简要结论、关键证据、争议与局限、下一步建议，并追加真实引用列表。"
                 f"默认假设：{assumption_text}"
             )
@@ -1637,27 +1500,11 @@ class BioResearchAgent:
                 f"围绕输入问题'{user_input}'进行深度研究。"
                 f"从多个维度展开：核心概念、实际应用、面临的挑战、未来趋势。"
                 f"优先使用权威来源，如学术论文、官方报告、行业分析等，必要时补充网页检索。"
-                f"默认至少审阅 {self.config.search.min_results_to_review} 条检索结果，"
-                f"并尽量提供不少于 {self._get_min_citations()} 条真实引用。"
                 f"输出中文研究型回答，语言自然流畅、通俗易懂，包含核心结论、关键证据、"
                 f"不同观点、局限性，并追加真实引用列表。"
                 f"默认假设：{assumption_text}"
             )
 
-    def _infer_focus(self, user_input: str) -> list[str]:
-        text = user_input.lower()
-        focus: list[str] = []
-        if any(token in text for token in ["功能", "机制", "mechanism", "function", "pathway", "repair"]):
-            focus.append("mechanism")
-        if any(token in text for token in ["临床", "clinical", "预后", "治疗", "drug", "response"]):
-            focus.append("clinical relevance")
-        if any(token in text for token in ["表达", "expression", "转录", "single-cell", "单细胞", "富集", "enrichment"]):
-            focus.append("pathway activity")
-        if any(token in text for token in ["variant", "mutation", "变异", "致病", "pathogenic", "clinvar"]):
-            focus.append("variant interpretation")
-        if any(token in text for token in ["p53", "tp53", "apoptosis", "cell cycle", "pseudotime", "slingshot", "atac", "rna-seq"]):
-            focus.append("cell state")
-        return dedupe_preserve_order(focus)
 
     def _heuristic_questions(self, entities: dict[str, Any]) -> list[dict[str, Any]]:
         gene = (entities.get("genes") or ["该目标"])[0]
@@ -1827,76 +1674,157 @@ class BioResearchAgent:
             )
         return specs[:5]
 
-    def _classify_question(self, text: str) -> str:
-        question = text.lower()
-        if any(token in question for token in ["clinvar", "分类", "证据等级", "别名", "record"]):
-            return "database"
-        if any(token in question for token in ["功能", "蛋白", "structure", "protein", "assay", "repair"]):
-            return "functional"
-        if any(token in question for token in ["病例", "clinical", "预后", "疾病", "cancer", "肿瘤"]):
-            return "disease"
-        if any(token in question for token in ["频率", "人群", "分布", "population"]):
-            return "frequency"
-        if any(token in question for token in ["机制", "通路", "pathway", "network"]):
-            return "mechanism"
-        return "overview"
 
-    def _normalize_question_type(self, question_type: str) -> str:
-        value = (question_type or "").strip().lower()
-        mapping = {
-            "expression": "mechanism",
-            "pathway": "mechanism",
-            "tumor_microenvironment": "disease",
-            "prognosis": "disease",
-            "clinical": "disease",
-            "overview": "overview",
-            "general": "overview",
-        }
-        return mapping.get(value, value if value in {"database", "functional", "disease", "frequency", "mechanism", "overview"} else "overview")
 
-    def _source_priority_for_question(self, question_type: str) -> list[str]:
-        mapping = {
-            "database": ["pubmed", "web", "clinvar", "uniprot"],
-            "functional": ["uniprot", "pubmed", "web", "clinvar"],
-            "disease": ["pubmed", "web", "clinvar", "uniprot"],
-            "frequency": ["clinvar", "pubmed", "web"],
-            "mechanism": ["uniprot", "pubmed", "web", "clinvar"],
-            "overview": ["pubmed", "web", "uniprot", "clinvar"],
-            "technical": ["web", "pubmed", "uniprot"],
-            "application": ["web", "pubmed", "uniprot"],
-            "challenge": ["web", "pubmed", "uniprot"],
-            "trend": ["web", "pubmed", "uniprot"],
-            "comparison": ["web", "pubmed", "uniprot", "clinvar"],
-        }
-        sources = list(mapping.get(question_type, ["pubmed", "web", "uniprot", "clinvar"]))
-        if self.config.search.allow_web_fallback:
-            sources.append("web")
-        return sources
+    def _adapt_search_strategy_dynamically(
+        self,
+        question: Any,
+        completed_task: "SearchTask",
+        results: list[Any],
+    ) -> None:
+        """在搜索循环中动态调整策略：基于已找到的结果质量生成补充查询。"""
+        evidence_count = len(question.evidence_ids)
+        source_result_counts = {}
+        for task in question.search_tasks:
+            if task.status in ("completed",):
+                source_result_counts[task.source_type] = source_result_counts.get(task.source_type, 0) + 1
 
-    def _min_evidence_for_question(self, question_type: str) -> int:
-        if question_type in {"database", "frequency"}:
-            return 1
-        if question_type == "functional":
-            return 2
-        if question_type == "disease":
-            return 3
-        if question_type == "mechanism":
-            return 3
-        return 2
+        total_results = sum(source_result_counts.values())
+        single_source_dominance = False
+        if total_results > 0:
+            max_single = max(source_result_counts.values()) if source_result_counts else 0
+            single_source_dominance = (max_single / total_results) > 0.8
 
-    def _task_result_target(self, source_type: str) -> int:
-        base = max(self.config.search.max_results_per_source, 1)
-        if source_type == "pubmed":
-            return max(base, 25)
-        if source_type == "web":
-            return max(base, 20)
-        if source_type == "clinvar":
-            return max(base, 10)
-        if source_type == "uniprot":
-            return max(base, 12)
-        return base
+        needs_more_sources = len(source_result_counts) < 2 and evidence_count < 5
 
-    def _build_search_tasks(self, question_text: str, question_type: str, source_priority: list[str]) -> list[SearchTask]:
+        if (len(results) == 0 and completed_task.status == "completed") or (
+            single_source_dominance and evidence_count < 8
+        ):
+            alternate_sources = ["pubmed", "web", "uniprot", "clinvar"]
+            unused_sources = [s for s in alternate_sources if s not in source_result_counts]
+            for alt_source in unused_sources[:2]:
+                existing_queries = {t.query.lower() for t in question.search_tasks if t.source_type == alt_source}
+                adapted_query = self._generate_adapted_query(completed_task, alt_source, question.text)
+                if adapted_query and adapted_query.lower() not in existing_queries:
+                    question.search_tasks.append(
+                        SearchTask(
+                            source_type=alt_source,
+                            query=adapted_query,
+                            rationale=f"基于 {completed_task.source_type} 结果不足，动态补充 {alt_source} 搜索。",
+                            max_results=self.config.search.max_results_per_source,
+                        )
+                    )
+                    self._emit(
+                        message=f"[{question.id}] 动态添加搜索任务: {alt_source}: {truncate_text(adapted_query, 100)}",
+                    )
+
+        if len(results) > 0 and evidence_count >= 3 and evidence_count < 10:
+            focus_gaps = self._detect_evidence_gap(question)
+            if focus_gaps:
+                for gap in focus_gaps[:1]:
+                    existing_queries = {t.query.lower() for t in question.search_tasks}
+                    gap_query = f"{gap}"
+                    if gap_query.lower() not in existing_queries:
+                        priority_source = completed_task.source_type if completed_task.source_type != "web" else "pubmed"
+                        question.search_tasks.append(
+                            SearchTask(
+                                source_type=priority_source,
+                                query=gap_query,
+                                rationale=f"检测到证据缺口: {gap}，定向补充搜索。",
+                                max_results=self.config.search.max_results_per_source,
+                            )
+                        )
+                        self._emit(
+                            message=f"[{question.id}] 定向补充搜索: {priority_source}: {truncate_text(gap_query, 100)}",
+                        )
+
+    def _generate_adapted_query(
+        self,
+        completed_task: "SearchTask",
+        target_source: str,
+        question_text: str,
+    ) -> str:
+        """基于已完成任务的源类型和问题文本，生成针对目标源的适应查询。"""
+        entities = self.state.parsed_entities
+        genes = entities.get("genes") or []
+        variants = (entities.get("variants") or []) + (entities.get("variant_aliases") or [])
+        diseases = entities.get("diseases") or []
+
+        gene = genes[0] if genes else ""
+        variant = variants[0] if variants else ""
+        disease = diseases[0] if diseases else ""
+
+        if target_source == "pubmed":
+            components = [g for g in genes[:2]]
+            if disease:
+                components.append(disease)
+            if variant:
+                components.append(variant)
+            if not components:
+                return question_text
+            return " ".join(components) + " review"
+
+        if target_source == "web":
+            components = [g for g in genes[:2]]
+            if variant:
+                components.append(variant)
+            if disease:
+                components.append(disease)
+            if not components:
+                return question_text
+            return " ".join(components) + " latest research"
+
+        if target_source == "clinvar":
+            if gene:
+                return gene if not variant else f"{gene} {variant}"
+            return question_text
+
+        if target_source == "uniprot":
+            if gene:
+                return f"gene:{gene}"
+            return question_text
+
+        return question_text
+
+    def _detect_evidence_gap(self, question: Any) -> list[str]:
+        """基于已有证据检测信息缺口。"""
+        evidence_list = self._question_evidence(question)
+        years = []
+        source_types = set()
+        has_clinical = False
+        has_mechanism = False
+
+        for ev in evidence_list:
+            if ev.year and ev.year.isdigit():
+                years.append(int(ev.year))
+            source_types.add(ev.source_type)
+            snippet = (ev.snippet_or_abstract or "").lower()
+            if any(t in snippet for t in ["clinical", "patient", "cohort", "trial"]):
+                has_clinical = True
+            if any(t in snippet for t in ["mechanism", "pathway", "signaling", "interaction"]):
+                has_mechanism = True
+
+        gaps = []
+        if years and max(years) < 2022:
+            genes = self.state.parsed_entities.get("genes") or []
+            gene = genes[0] if genes else ""
+            gaps.append(f"{gene} latest research 2023 2024")
+
+        if not has_clinical and question.type in ("disease", "clinical"):
+            disease = (self.state.parsed_entities.get("diseases") or [""])[0]
+            gene = (self.state.parsed_entities.get("genes") or [""])[0]
+            if gene:
+                gaps.append(f"{gene} {disease} clinical trial patient".strip())
+
+        if not has_mechanism and question.type in ("mechanism", "functional"):
+            gene = (self.state.parsed_entities.get("genes") or [""])[0]
+            if gene:
+                gaps.append(f"{gene} mechanism pathway interaction")
+
+        return gaps
+
+
+    def _build_search_tasks(self, question_text: str, question_type: str) -> list[SearchTask]:
         tasks: list[SearchTask] = []
         seen: set[tuple[str, str]] = set()
         
@@ -1912,7 +1840,8 @@ class BioResearchAgent:
                 "relevance": expansion.relevance_score,
             })
         
-        for source_type in source_priority:
+        default_sources = ["pubmed", "web", "uniprot", "clinvar"]
+        for source_type in default_sources:
             queries = self._build_source_queries(source_type, question_text, question_type)
             
             # 添加扩展查询
@@ -1935,7 +1864,7 @@ class BioResearchAgent:
                         source_type=source_type,
                         query=query,
                         rationale=f"使用 {source_type} 回答该问题。",
-                        max_results=self._task_result_target(source_type),
+                        max_results=self.config.search.max_results_per_source,
                     )
                 )
         return tasks
@@ -2268,15 +2197,25 @@ class BioResearchAgent:
         evidence_id = hashlib.sha1(f"{question.id}|{result.source_type}|{source_key}".encode("utf-8")).hexdigest()[:16]
         snippet = truncate_text(result.snippet or result.title, 1000)
         
-        # 尝试抓取网页全文内容（针对web来源）
+        # Extract PMID and DOI from metadata for full text fetching
+        pmid = result.metadata.get("pmid", "") or result.metadata.get("PMID", "")
+        doi = result.metadata.get("doi", "") or result.metadata.get("DOI", "")
+        
+        # 为所有来源尝试获取全文内容（不截断）
         full_content = ""
-        if result.source_type == "web" and result.url:
+        if result.url or pmid or doi:
             try:
-                full_content = self.content_fetcher.fetch_content(result.url, max_chars=6000)
+                full_content = self.full_text_fetcher.fetch_full_content(
+                    url=result.url, 
+                    source_type=result.source_type,
+                    pmid=pmid,
+                    doi=doi,
+                    max_chars=1000000  # 不截断
+                )
                 if full_content and len(full_content) > 200:
-                    snippet = truncate_text(full_content, 6000)
+                    snippet = truncate_text(full_content, 6000)  # 仅截断 snippet 用于显示
             except Exception as exc:
-                logger.info("Failed to fetch full content for %s: %s", result.url, exc)
+                logger.info("Failed to fetch full content for %s (%s): %s", result.url or pmid or doi, result.source_type, exc)
         
         claim_summary = self._summarize_claim(result)
         relevance = self._result_relevance_score(question, result)
@@ -2295,6 +2234,7 @@ class BioResearchAgent:
             confidence=self._score_evidence(result, relevance),
             retrieved_at=format_timestamp(),
             metadata={**result.metadata, "relevance_score": relevance, "has_full_content": bool(full_content)},
+            full_content=full_content,
         )
 
     def _summarize_claim(self, result: SearchResult) -> str:
@@ -2345,13 +2285,13 @@ class BioResearchAgent:
 
     def _minimum_relevance_for_source(self, source_type: str) -> float:
         thresholds = {
-            "clinvar": 0.4,
+            "clinvar": 0.45,
             "uniprot": 0.45,
-            "pubmed": 0.52,
-            "web": 0.25,  # 降低web搜索的门槛
+            "pubmed": 0.45,
+            "web": 0.45,
             "local": 0.3,
         }
-        return thresholds.get(source_type, 0.5)
+        return thresholds.get(source_type, 0.45)
 
     def _result_relevance_score(self, question: Question, result: SearchResult) -> float:
         text = f"{result.title} {result.snippet}".lower()
@@ -2631,7 +2571,6 @@ class BioResearchAgent:
     def _should_continue(self, round_num: int, new_evidence_ids: list[str]) -> tuple[bool, str]:
         all_done = all(question.status in {"answered", "blocked"} for question in self.state.questions)
         pending_tasks = any(task.status == "pending" for question in self.state.questions for task in question.search_tasks)
-        research_floor_met = self._research_floor_met()
 
         if round_num < self.config.agent.min_rounds:
             return True, ""
@@ -2639,21 +2578,14 @@ class BioResearchAgent:
         if round_num >= self.config.agent.max_rounds:
             return False, self._compose_progress_reason("达到最大研究轮次。")
 
-        if all_done and research_floor_met:
-            return False, self._compose_progress_reason("所有问题已回答或标记为无法继续。")
-
         if all_done and pending_tasks:
             return True, ""
 
         if not new_evidence_ids and not pending_tasks:
-            if research_floor_met:
-                return False, self._compose_progress_reason("未获得新证据且没有剩余搜索任务。")
-            return True, ""
+            return False, self._compose_progress_reason("未获得新证据且没有剩余搜索任务。")
 
         if not pending_tasks:
-            if research_floor_met:
-                return False, self._compose_progress_reason("当前问题的搜索计划已执行完毕。")
-            return True, ""
+            return False, self._compose_progress_reason("当前问题的搜索计划已执行完毕。")
 
         return True, ""
 
@@ -2677,31 +2609,6 @@ class BioResearchAgent:
                     "why": "解释当前矛盾证据。",
                 }
                 )
-
-        if not self._search_floor_met() or not self._citation_floor_met():
-            target_text = " ".join(part for part in [gene, variant, disease] if part) or self.state.user_input
-            candidate_specs.extend(
-                [
-                    {
-                        "text": f"{target_text} 的系统综述、队列研究和代表性综述性文献还有哪些？",
-                        "type": "overview",
-                        "priority": 2,
-                        "why": "扩大检索覆盖面，补足代表性综述和临床队列证据。",
-                    },
-                    {
-                        "text": f"{gene} 在 {disease} 中的机制研究、DNA repair 或通路证据还可以补充哪些关键文献？",
-                        "type": "mechanism",
-                        "priority": 2,
-                        "why": "继续补足机制和实验层面的代表性证据。",
-                    },
-                    {
-                        "text": f"{target_text} 的病例、病例系列、变异数据库记录或临床解释文章还有哪些？",
-                        "type": "disease" if variant or disease else "overview",
-                        "priority": 2,
-                        "why": "继续补足临床解释与病例层证据。",
-                    },
-                ]
-            )
 
         for gap in round_result.gaps[: self.config.agent.max_followup_questions]:
             if "功能" in gap or any(question.type == "functional" and question.status != "answered" for question in self.state.questions):
@@ -2761,7 +2668,7 @@ class BioResearchAgent:
                         model_specs.append(
                             {
                                 "text": text,
-                                "type": self._normalize_question_type(item.get("type") or self._classify_question(text)),
+                                "type": (item.get("type") or "general").strip().lower(),
                                 "priority": int(item.get("priority") or 2),
                                 "why": item.get("why") or "模型建议的后续研究问题。",
                             }
@@ -2779,8 +2686,7 @@ class BioResearchAgent:
             if key in existing:
                 continue
             existing.add(key)
-            question_type = self._normalize_question_type(spec.get("type") or self._classify_question(text))
-            source_priority = self._source_priority_for_question(question_type)
+            question_type = (spec.get("type") or "general").strip().lower()
             followups.append(
                 Question(
                     id=self._next_question_id("F", existing=self.state.questions + followups),
@@ -2788,14 +2694,60 @@ class BioResearchAgent:
                     type=question_type,
                     priority=int(spec.get("priority") or 2),
                     why=spec.get("why") or "补足当前缺口。",
-                    source_priority=source_priority,
-                    search_tasks=self._build_search_tasks(text, question_type, source_priority),
-                    min_evidence=self._min_evidence_for_question(question_type),
+                    source_priority=["pubmed", "web", "uniprot", "clinvar"],
+                    search_tasks=self._build_search_tasks(text, question_type),
+                    min_evidence=2,
                 )
             )
             if len(followups) >= self.config.agent.max_followup_questions:
                 break
         return followups
+
+    def _generate_expansion_questions(self) -> list[Question]:
+        """当引用数量不足时，强制生成扩展搜索问题（优先web来源）。"""
+        expansion_topics = [
+            {"text": f"相关研究和最新进展综述", "type": "overview"},
+            {"text": f"临床意义和治疗策略探讨", "type": "disease"},
+            {"text": f"分子机制和信号通路分析", "type": "mechanism"},
+            {"text": f"最新研究成果和技术趋势", "type": "trend"},
+        ]
+        
+        # 如果有实体信息，可以生成更具体的问题
+        if self.state.parsed_entities.get("genes"):
+            gene = self.state.parsed_entities["genes"][0]
+            expansion_topics = [
+                {"text": f"{gene}基因在肿瘤中的最新研究进展", "type": "overview"},
+                {"text": f"{gene}相关的信号通路和分子机制", "type": "mechanism"},
+                {"text": f"针对{gene}的治疗策略和临床进展", "type": "disease"},
+                {"text": f"肿瘤微环境和免疫治疗最新趋势", "type": "trend"},
+            ]
+        
+        existing = {question.text.lower() for question in self.state.questions}
+        expansion_questions: list[Question] = []
+        
+        for topic in expansion_topics[:3]:  # 最多生成3个扩展问题
+            text = topic["text"]
+            key = text.lower()
+            if key in existing:
+                continue
+            existing.add(key)
+            question_type = topic["type"]
+            # 优先使用web搜索
+            source_priority = ["web", "pubmed", "uniprot", "clinvar"]
+            expansion_questions.append(
+                Question(
+                    id=self._next_question_id("E", existing=self.state.questions + expansion_questions),
+                    text=text,
+                    type=question_type,
+                    priority=1,  # 最高优先级
+                    why="引用数量不足，强制扩展搜索。",
+                    source_priority=source_priority,
+                    search_tasks=self._build_search_tasks(text, question_type, source_priority),
+                    min_evidence=3,
+                )
+            )
+        
+        return expansion_questions
 
     def _next_question_id(self, prefix: str, existing: Optional[list[Question]] = None) -> str:
         existing_ids = {question.id for question in (existing or self.state.questions or [])}
@@ -2806,24 +2758,23 @@ class BioResearchAgent:
 
     def _select_citations(self) -> list[dict[str, Any]]:
         limit = self._citation_selection_limit()
-        target = self._get_min_citations()
         selected_evidence: list[Evidence] = []
         seen_sources: set[tuple[str, str]] = set()
         covered_questions: set[str] = set()
         allowed_sources = self._reference_source_types()
 
-        # 第一轮：确保每个来源类型都有代表
         source_type_counts = {}
         for threshold in self._citation_thresholds():
             evidence_list = self._rank_citation_candidates(threshold)
             for evidence in evidence_list:
                 if evidence.source_type not in allowed_sources:
                     continue
+                if not evidence.full_content or len(evidence.full_content) < 500:
+                    continue
                 signature = (evidence.source_type, evidence.source_id or evidence.url)
                 if signature in seen_sources:
                     continue
                 
-                # 优先确保多样性
                 current_count = source_type_counts.get(evidence.source_type, 0)
                 if current_count < 5 or evidence.question_id not in covered_questions:
                     selected_evidence.append(evidence)
@@ -2833,11 +2784,8 @@ class BioResearchAgent:
                     
                 if len(selected_evidence) >= limit:
                     break
-            if len(selected_evidence) >= target:
+            if len(selected_evidence) >= limit:
                 break
-
-        # 确保web来源至少有2条
-        selected_evidence = self._ensure_source_diversity(selected_evidence, min_per_type=2)
 
         if not selected_evidence:
             return []
@@ -2855,6 +2803,7 @@ class BioResearchAgent:
                     "claim_summary": evidence.claim_summary,
                     "url": evidence.url,
                     "year": evidence.year,
+                    "full_content": evidence.full_content,
                 }
             )
         return citations

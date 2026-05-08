@@ -353,6 +353,7 @@ async def export_results() -> dict[str, Any]:
             source_type = citation.get("source_type", "unknown")
             claim = citation.get("claim_summary", "")
             year = citation.get("year", "")
+            full_content = citation.get("full_content", "")
             
             # 创建引用文件内容
             citation_content = f"# [{label}] {title}\n\n"
@@ -368,21 +369,25 @@ async def export_results() -> dict[str, Any]:
             
             citation_content += f"---\n\n"
             
-            # 根据来源类型获取详细内容
-            detailed_content = ""
-            if source_type == "pubmed":
-                detailed_content = _fetch_pubmed_abstract(url, session)
-            elif source_type == "web":
-                detailed_content = _fetch_web_content(url, session)
-            elif source_type == "clinvar":
-                detailed_content = _fetch_clinvar_details(url, session)
-            elif source_type == "uniprot":
-                detailed_content = _fetch_uniprot_details(url, session)
-            
-            if detailed_content:
-                citation_content += f"## 详细内容\n\n{detailed_content}\n"
+            # 优先使用已获取的完整原文内容
+            if full_content and len(full_content) > 100:
+                citation_content += f"## 全文内容\n\n{full_content}\n"
             else:
-                citation_content += f"## 详细内容\n\n*无法获取详细内容，请访问原文链接查看。*\n"
+                # 如果没有全文内容，尝试重新获取
+                detailed_content = ""
+                if source_type == "pubmed":
+                    detailed_content = _fetch_pubmed_abstract(url, session)
+                elif source_type == "web":
+                    detailed_content = _fetch_web_content(url, session)
+                elif source_type == "clinvar":
+                    detailed_content = _fetch_clinvar_details(url, session)
+                elif source_type == "uniprot":
+                    detailed_content = _fetch_uniprot_details(url, session)
+                
+                if detailed_content:
+                    citation_content += f"## 全文内容\n\n{detailed_content}\n"
+                else:
+                    citation_content += f"## 全文内容\n\n*无法获取全文内容，请访问原文链接查看。*\n"
             
             # 保存引用文件
             citation_file = citations_dir / f"{label}.md"
@@ -509,11 +514,7 @@ def _fetch_web_content(url: str, session: requests.Session) -> str:
             text_content = html.unescape(text_content)
             text_content = re.sub(r'\s+', ' ', text_content).strip()
         
-        # 限制长度
-        max_length = 10000
-        if len(text_content) > max_length:
-            text_content = text_content[:max_length] + "\n\n*(内容过长，已截断)*"
-        
+        # NO TRUNCATION - return complete content
         if text_content:
             return text_content
         else:
